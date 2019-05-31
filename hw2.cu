@@ -335,6 +335,10 @@ int main(int argc, char *argv[]) {
 			if (free_stream < 0)
 				continue;
 
+			if (!rate_limit_can_send(&rate_limit)) {
+                  --img_idx;
+                  continue;
+            }
 
             /*rate_limit_wait(&rate_limit);*/
             req_t_start[img_idx] = get_time_msec();
@@ -390,7 +394,12 @@ int main(int argc, char *argv[]) {
              * update req_t_end of completed requests 
              */
 
-            rate_limit_wait(&rate_limit);
+            /*rate_limit_wait(&rate_limit);*/
+			if (!rate_limit_can_send(&rate_limit)) {
+                  --img_idx;
+                  continue;
+            }
+
             req_t_start[img_idx] = get_time_msec();
 
             /* TODO push task to queue */

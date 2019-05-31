@@ -206,8 +206,6 @@ void print_usage_and_die(char *progname) {
 void checkCompletedRequests(cudaStream_t streams[64], double *req_t_end,
 							int *free_stream, int stream2img[64])
 {
-	double ti = get_time_msec();
-
 	for (int i = 0; i < 64; i++)
 		/*printf("Value of stream2img[%d] is %d\n",i, stream2img[i]);*/
 		if ( cudaStreamQuery(streams[i]) == cudaSuccess) {
@@ -216,9 +214,9 @@ void checkCompletedRequests(cudaStream_t streams[64], double *req_t_end,
 				*free_stream = i;
 
 			if (stream2img[i] >= 0) {
-				req_t_end[stream2img[i]] = ti;
+				req_t_end[stream2img[i]] = get_time_msec();
 				printf("Stream %d for image %d finished, time %lf\n",
-						i, stream2img[i], ti);
+						i, stream2img[i], req_t_end[stream2img[i]]);
 				stream2img[i] = -1;
 			}
 		}
@@ -311,13 +309,10 @@ int main(int argc, char *argv[]) {
     /* TODO allocate / initialize memory, streams, etc... */
 	uchar *gpu_image_in, *gpu_image_out;
     CUDA_CHECK(cudaMemset(images_out_from_gpu, 0, NREQUESTS * SQR(IMG_DIMENSION)));
-	CUDA_CHECK(cudaMalloc(&gpu_image_in, SQR(IMG_DIMENSION)));
-	CUDA_CHECK(cudaMalloc(&gpu_image_out, SQR(IMG_DIMENSION)));
-
 
     cudaStream_t streams[64];
     int free_stream;
-    
+
     for(int i = 0; i < 64; i++) {
     	cudaStreamCreate(&streams[i]);
     }
@@ -325,6 +320,11 @@ int main(int argc, char *argv[]) {
 
     double ti = get_time_msec();
     if (mode == PROGRAM_MODE_STREAMS) {
+
+		// allocate the pointers we're working with
+		CUDA_CHECK(cudaMalloc(&gpu_image_in, NREQUESTS * SQR(IMG_DIMENSION)));
+		CUDA_CHECK(cudaMalloc(&gpu_image_out, NREQUESTS * SQR(IMG_DIMENSION)));
+
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
         	free_stream = -1;
 
@@ -340,58 +340,58 @@ int main(int argc, char *argv[]) {
                   continue;
             }
 
-            /*rate_limit_wait(&rate_limit);*/
             req_t_start[img_idx] = get_time_msec();
 
             stream2img[free_stream] = img_idx;
 
-			printf("chose stream %d and gave it img_ix: %d\n", free_stream,
-													stream2img[free_stream]);
-
             /* TODO place memcpy's and kernels in a stream */
-            CUDA_CHECK(cudaMemcpyAsync(gpu_image_in, &images_in[img_idx * SQR(IMG_DIMENSION)],
-            					  SQR(IMG_DIMENSION), cudaMemcpyHostToDevice, streams[free_stream]));
-			
-            gpu_process_image<<<1, 1024, 0, streams[free_stream]>>>(gpu_image_in, gpu_image_out);
+            CUDA_CHECK(cudaMemcpyAsync(&gpu_image_in[img_idx * SQR(IMG_DIMENSION)],
+									   &images_in[img_idx * SQR(IMG_DIMENSION)],
+									   SQR(IMG_DIMENSION), cudaMemcpyHostToDevice,
+									   streams[free_stream]));
+
+            gpu_process_image<<<1, 1024, 0, streams[free_stream]>>>(&gpu_image_in[img_idx * SQR(IMG_DIMENSION)],
+            														&gpu_image_out[img_idx * SQR(IMG_DIMENSION)]);
 
 			CUDA_CHECK(cudaMemcpyAsync(&images_out_from_gpu[img_idx * SQR(IMG_DIMENSION)],
-									   gpu_image_out, SQR(IMG_DIMENSION),
+									   &gpu_image_out[img_idx * SQR(IMG_DIMENSION)],
+									   SQR(IMG_DIMENSION),
 									   cudaMemcpyDeviceToHost, streams[free_stream]));
 
         }
+
+        // freeing memory
+        CUDA_CHECK(cudaFree(gpu_image_in));
+        CUDA_CHECK(cudaFree(gpu_image_out));
+
+        /* TODO now make sure to wait for all streams to finish */
         int done = 0, ix = 0;
+
+		// count all pending jobs
 		for (int j = 0; j < 64; j++) {
 			done += stream2img[j] >= 0;
 		}
+		printf("%d jobs still waiting to finish\n", done);
 
+        // busy-wait on jobs till everyone finishes
         while (done > 0) {
 
         	if (stream2img[ix] >= 0 && cudaStreamQuery(streams[ix]) == cudaSuccess) {
-				req_t_end[stream2img[ix]] = ti;
-				stream2img[ix] = -1;
+				req_t_end[stream2img[ix]] = get_time_msec();
 				done--;
-				printf("Stream %d for image %d finished, time %lf\n",
-						ix, stream2img[ix], ti);
+				printf("Stream %d for image %d finished, time %f\n",
+						ix, stream2img[ix], req_t_end[stream2img[ix]]);
+				stream2img[ix] = -1;
         	}
         	ix = (ix + 1) % 64;
         }
-
-		/*for (int i = 0; i < 64; i++) {*/
-			/*cudaStreamSynchronize(streams[i]);*/
-			/*checkCompletedRequests(streams, req_t_end,*/
-								   /*&free_stream, stream2img);*/
-		/*}*/
-        /*cudaDeviceSynchronize();*/
-
-
-        /* TODO now make sure to wait for all streams to finish */
 
     } else if (mode == PROGRAM_MODE_QUEUE) {
         // TODO launch GPU consumer-producer kernel
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
             /* TODO check producer consumer queue for any responses.
              * don't block. if no responses are there we'll check again in the next iteration
-             * update req_t_end of completed requests 
+             * update req_t_end of completed requests
              */
 
             /*rate_limit_wait(&rate_limit);*/

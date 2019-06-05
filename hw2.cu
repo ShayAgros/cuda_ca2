@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <time.h>
 #include <assert.h>
 #include <string.h>
@@ -11,7 +12,14 @@
 #define IMG_DIMENSION 32
 #define NREQUESTS 5
 
+#define SHARED_MEMORY_SZ_PER_TB (256*2)
+
+#define QUEUE_SLOTS_NR 10
+#define KERNEL_MAX_REGISTERS 32
+
+
 typedef unsigned char uchar;
+bool terminate = false;
 
 #define CUDA_CHECK(f) do {                                                                  \
     cudaError_t e = f;                                                                      \
@@ -157,8 +165,8 @@ __device__ void prefix_sum(int arr[], int arr_size) {
 }
 
 __global__ void gpu_process_image(uchar *in, uchar *out) {
-    __shared__ int histogram[256];
-    __shared__ int hist_min[256];
+    __shared__ int histogram[SHARED_MEMORY_SZ_PER_TB/2];
+    __shared__ int hist_min[SHARED_MEMORY_SZ_PER_TB/2];
 
     int tid = threadIdx.x;
 
@@ -195,12 +203,74 @@ __global__ void gpu_process_image(uchar *in, uchar *out) {
     return;
 }
 
+void gpu_tb_servers(char rq[QUEUE_SLOTS_NR][SQR(IMG_DIMENSION +1)],
+					char sq[QUEUE_SLOTS_NR][SQR(IMG_DIMENSION) + 1]) {
+
+    __shared__ uchar in_image[SQR(IMG_DIMENSION)];
+    __shared__ uchar out_image[SQR(IMG_DIMENSION)];
+
+    int tid = threadIdx.x;
+    int in_ix = -1;
+    int out_ix = 0;
+
+	while (!terminate) {
+
+		if (tid == 0)
+			for (int i = 0; i < QUEUE_SLOTS_NR; i++) {
+				if (rq[i][0] > 0) {
+					in_ix = i;
+					break;
+					
+				}
+			}
+		
+		// check if need to copy
+		__syncthreads();
+		
+		gpu_process_image(&rq[in_ix][1], &sq[out_ix][1])
+		
+	
+	}
+
+}
+
 void print_usage_and_die(char *progname) {
     printf("usage:\n");
     printf("%s streams <load (requests/sec)>\n", progname);
     printf("OR\n");
     printf("%s queue <#threads> <load (requests/sec)>\n", progname);
     exit(1);
+}
+
+int get_threadblock_number_device(int threads_per_block__nr, int device_number) {
+	cudaDeviceProp prop;
+	int tb_nr = 0;
+	int global_memory_per_block = SQR(IMG_DIMENSION) * QUEUE_SLOTS_NR; 
+	/*int shared_memory_per_block = */
+	int global_tb_nr, registers_tb_nr;
+
+	CUDA_CHECK(cudaGetDeviceProperties(&prop, device_number));
+	
+	// how maybe thread-blocks based on total global memory
+	global_tb_nr = prop.totalGlobalMem / global_memory_per_block;
+	tb_nr = (tb_nr > global_tb_nr) ? global_tb_nr : tb_nr;
+
+	// how maybe thread-blocks based on register number per thread
+	/*registers_tb_nr = */
+
+	return tb_nr;
+}
+
+int get_threadblock_number(int threads_nr) {
+	int min = 0, devices_nr;
+
+	CUDA_CHECK(cudaGetDeviceCount(&devices_nr));
+	for (int i = 0; i < devices_nr; i++) {
+		int cur = get_threadblock_number_device(threads_nr, i);
+		min = (cur < min) ? cur : min;
+	}
+
+	return min;
 }
 
 void checkCompletedRequests(cudaStream_t streams[64], double *req_t_end,
@@ -388,6 +458,9 @@ int main(int argc, char *argv[]) {
 
     } else if (mode == PROGRAM_MODE_QUEUE) {
         // TODO launch GPU consumer-producer kernel
+        /*int tb_nr = get_threadblock_number(threads_queue_mode);*/
+        int tb_nr = 4;
+
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
             /* TODO check producer consumer queue for any responses.
              * don't block. if no responses are there we'll check again in the next iteration

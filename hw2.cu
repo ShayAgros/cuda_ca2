@@ -11,15 +11,22 @@
 ///////////////////////////////////////////////// DO NOT CHANGE ///////////////////////////////////////
 #define IMG_DIMENSION 32
 #define NREQUESTS 5
+#define THREADS_NR SQR(IMG_DIMENSION)
 
 #define SHARED_MEMORY_SZ_PER_TB (256*2)
 
 #define QUEUE_SLOTS_NR 10
 #define KERNEL_MAX_REGISTERS 32
 
+#define VALID_BIT_IX 0
+#define DATA_IX 1
+
+// Treat a one-dimensional array as a two dimensional array of type
+// queue[QUEUE_SLOTS_NR][(1 + SQR(IMG_DIMENSION))]
+#define QUEUE_IX(q, first_dim, second_dim) \
+	q[first_dim * (1 + SQR(IMG_DIMENSION)) + second_dim]
 
 typedef unsigned char uchar;
-bool terminate = false;
 
 #define CUDA_CHECK(f) do {                                                                  \
     cudaError_t e = f;                                                                      \
@@ -203,32 +210,96 @@ __global__ void gpu_process_image(uchar *in, uchar *out) {
     return;
 }
 
-void gpu_tb_servers(char rq[QUEUE_SLOTS_NR][SQR(IMG_DIMENSION +1)],
-					char sq[QUEUE_SLOTS_NR][SQR(IMG_DIMENSION) + 1]) {
-
-    __shared__ uchar in_image[SQR(IMG_DIMENSION)];
-    __shared__ uchar out_image[SQR(IMG_DIMENSION)];
+__device__ void gpu_queues_process_image(uchar *in, uchar *out) {
+    __shared__ int histogram[SHARED_MEMORY_SZ_PER_TB/2];
+    __shared__ int hist_min[SHARED_MEMORY_SZ_PER_TB/2];
 
     int tid = threadIdx.x;
-    int in_ix = -1;
-    int out_ix = 0;
 
-	while (!terminate) {
+    if (tid < 256) {
+        histogram[tid] = 0;
+    }
+    __syncthreads();
+
+    for (int i = tid; i < SQR(IMG_DIMENSION); i += blockDim.x)
+        atomicAdd(&histogram[in[i]], 1);
+
+    __syncthreads();
+
+    prefix_sum(histogram, 256);
+
+    if (tid < 256) {
+        hist_min[tid] = histogram[tid];
+    }
+    __syncthreads();
+
+    int cdf_min = arr_min(hist_min, 256);
+
+    __shared__ uchar map[256];
+    if (tid < 256) {
+        int map_value = (float)(histogram[tid] - cdf_min) / (SQR(IMG_DIMENSION) - cdf_min) * 255;
+        map[tid] = (uchar)map_value;
+    }
+
+    __syncthreads();
+
+    for (int i = tid; i < SQR(IMG_DIMENSION); i += blockDim.x) {
+        out[i] = map[in[i]];
+    }
+    return;
+}
+
+// an invalid queue index has VALID_BIT set to 0. Otherwise it's valid
+__global__ void gpu_tb_server(uchar *rqs, uchar *sqs, bool *terminate) {
+	__shared__ int in_ix;
+	__shared__ int out_ix;
+	__shared__ uchar *rq;
+	__shared__ uchar *sq;
+
+	// find local queue for thread block
+	rq = rqs + blockIdx.x * (QUEUE_SLOTS_NR * (1 + SQR(IMG_DIMENSION)));
+	sq = sqs + blockIdx.x * (QUEUE_SLOTS_NR * (1 + SQR(IMG_DIMENSION)));
+
+	int tid = threadIdx.x;
+
+	in_ix = -1;
+	out_ix = 0;
+
+	while (!(*terminate)) {
 
 		if (tid == 0)
-			for (int i = 0; i < QUEUE_SLOTS_NR; i++) {
-				if (rq[i][0] > 0) {
+			for (int i = 0; ; (i++) % QUEUE_SLOTS_NR) {
+				if (QUEUE_IX(rq,i, VALID_BIT_IX)) {
 					in_ix = i;
+					break;
+				}
+				if (*terminate)
+					return;
+			}
+		
+		__syncthreads();
+		gpu_queues_process_image(&QUEUE_IX(rq,in_ix,DATA_IX), &QUEUE_IX(sq,out_ix,DATA_IX));
+		__syncthreads();
+
+		if (tid == 0) {
+
+			__threadfence_system();
+			QUEUE_IX(sq,out_ix,VALID_BIT_IX) = 1;
+			QUEUE_IX(rq,in_ix,VALID_BIT_IX) = 0;
+			__threadfence_system();
+
+			for (int i = 0; !(*terminate); (i++) % QUEUE_SLOTS_NR) {
+				if (QUEUE_IX(sq,i,0) == 0) {
+					out_ix = i;
 					break;
 					
 				}
 			}
-		
-		// check if need to copy
+			// choose new out_ix
+		}
+
+		__threadfence_system();
 		__syncthreads();
-		
-		gpu_process_image(&rq[in_ix][1], &sq[out_ix][1])
-		
 	
 	}
 
@@ -292,6 +363,23 @@ void checkCompletedRequests(cudaStream_t streams[64], double *req_t_end,
 		}
 }
 
+void initialize_terminate_variable(bool **cpu_terminate, bool **gpu_terminate)
+{
+    CUDA_CHECK( cudaHostAlloc(cpu_terminate, sizeof(bool), 0) );
+
+	CUDA_CHECK(cudaHostGetDevicePointer(gpu_terminate, *cpu_terminate, 0 ));
+}
+
+void initialize_gpu_tb_server_queues(uchar **cpu_rq, uchar **gpu_rq,
+                                     uchar **cpu_sq, uchar **gpu_sq,
+                                     int tb_nr)
+{
+    CUDA_CHECK( cudaHostAlloc(cpu_rq, tb_nr * (QUEUE_SLOTS_NR * (1 + SQR(IMG_DIMENSION))), 0) );
+    CUDA_CHECK( cudaHostAlloc(cpu_sq, tb_nr * (QUEUE_SLOTS_NR * (1 + SQR(IMG_DIMENSION))), 0) );
+
+	CUDA_CHECK(cudaHostGetDevicePointer(gpu_rq, *cpu_rq, 0 ));
+	CUDA_CHECK(cudaHostGetDevicePointer(gpu_sq, *cpu_sq, 0 ));
+}
 
 enum {PROGRAM_MODE_STREAMS = 0, PROGRAM_MODE_QUEUE};
 int main(int argc, char *argv[]) {
@@ -346,7 +434,7 @@ int main(int argc, char *argv[]) {
         t_start = get_time_msec();
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
             CUDA_CHECK(cudaMemcpy(gpu_image_in, &images_in[img_idx * SQR(IMG_DIMENSION)], SQR(IMG_DIMENSION), cudaMemcpyHostToDevice));
-            gpu_process_image<<<1, 1024>>>(gpu_image_in, gpu_image_out);
+            gpu_process_image<<<1, THREADS_NR>>>(gpu_image_in, gpu_image_out);
             CUDA_CHECK(cudaMemcpy(&images_out_from_gpu[img_idx * SQR(IMG_DIMENSION)], gpu_image_out, SQR(IMG_DIMENSION), cudaMemcpyDeviceToHost));
         }
         total_distance += distance_sqr_between_image_arrays(images_out, images_out_from_gpu);
@@ -420,7 +508,7 @@ int main(int argc, char *argv[]) {
 									   SQR(IMG_DIMENSION), cudaMemcpyHostToDevice,
 									   streams[free_stream]));
 
-            gpu_process_image<<<1, 1024, 0, streams[free_stream]>>>(&gpu_image_in[img_idx * SQR(IMG_DIMENSION)],
+            gpu_process_image<<<1, THREADS_NR, 0, streams[free_stream]>>>(&gpu_image_in[img_idx * SQR(IMG_DIMENSION)],
             														&gpu_image_out[img_idx * SQR(IMG_DIMENSION)]);
 
 			CUDA_CHECK(cudaMemcpyAsync(&images_out_from_gpu[img_idx * SQR(IMG_DIMENSION)],
@@ -459,6 +547,19 @@ int main(int argc, char *argv[]) {
     } else if (mode == PROGRAM_MODE_QUEUE) {
         // TODO launch GPU consumer-producer kernel
 		int tb_nr = get_threadblock_number(threads_queue_mode);
+		uchar *cpu_rq, *gpu_rq;
+		uchar *cpu_sq, *gpu_sq;
+		bool *cpu_terminate, *gpu_terminate;
+
+		initialize_gpu_tb_server_queues(&cpu_rq, &cpu_sq, &gpu_rq, &gpu_sq, tb_nr);
+		initialize_terminate_variable(&cpu_terminate,&gpu_terminate);
+
+		// set programming running
+		*cpu_terminate = false;
+		__sync_synchronize();
+
+		// launch  servers
+		gpu_tb_server <<< tb_nr, threads_queue_mode >>> (gpu_rq, gpu_sq, gpu_terminate);
 
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
             /* TODO check producer consumer queue for any responses.
@@ -476,7 +577,13 @@ int main(int argc, char *argv[]) {
 
             /* TODO push task to queue */
         }
+
+		// close open threads
+		*cpu_terminate = true;
+		__sync_synchronize();
+
         /* TODO wait until you have responses for all requests */
+
     } else {
         assert(0);
     }

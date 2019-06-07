@@ -244,21 +244,21 @@ void print_usage_and_die(char *progname) {
 
 int get_threadblock_number_device(int threads_per_block__nr, int device_number) {
 	cudaDeviceProp prop;
+	int max_threads_tb_nr;
+	int max_shared_mem_tb_nr;
+	int max_regs_tb_nr;
 	int tb_nr = 0;
-	int global_memory_per_block = SQR(IMG_DIMENSION) * QUEUE_SLOTS_NR; 
-	/*int shared_memory_per_block = */
-	int global_tb_nr, registers_tb_nr;
 
 	CUDA_CHECK(cudaGetDeviceProperties(&prop, device_number));
 	
-	// how maybe thread-blocks based on total global memory
-	global_tb_nr = prop.totalGlobalMem / global_memory_per_block;
-	tb_nr = (tb_nr > global_tb_nr) ? global_tb_nr : tb_nr;
+	max_threads_tb_nr = prop.maxThreadsPerMultiProcessor / threads_per_block__nr;
+	max_shared_mem_tb_nr = prop.sharedMemPerMultiprocessor / SHARED_MEMORY_SZ_PER_TB;
+	max_regs_tb_nr = prop.regsPerMultiprocessor / (KERNEL_MAX_REGISTERS * threads_per_block__nr);
 
-	// how maybe thread-blocks based on register number per thread
-	/*registers_tb_nr = */
+	tb_nr = (max_threads_tb_nr > max_shared_mem_tb_nr) ? max_shared_mem_tb_nr : max_threads_tb_nr;
+	tb_nr = (tb_nr > max_regs_tb_nr) ? max_regs_tb_nr : tb_nr;
 
-	return tb_nr;
+	return tb_nr * prop.multiProcessorCount;
 }
 
 int get_threadblock_number(int threads_nr) {
@@ -458,8 +458,7 @@ int main(int argc, char *argv[]) {
 
     } else if (mode == PROGRAM_MODE_QUEUE) {
         // TODO launch GPU consumer-producer kernel
-        /*int tb_nr = get_threadblock_number(threads_queue_mode);*/
-        int tb_nr = 4;
+		int tb_nr = get_threadblock_number(threads_queue_mode);
 
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
             /* TODO check producer consumer queue for any responses.

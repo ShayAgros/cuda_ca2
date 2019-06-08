@@ -22,10 +22,11 @@
 #define IMGIX_BIT_IX 1
 #define DATA_IX 1 + sizeof(int)
 
+#define CELL_SIZE (1 + sizeof(int) + SQR(IMG_DIMENSION))
 // Treat a one-dimensional array as a two dimensional array of type
-// queue[QUEUE_SLOTS_NR][(1 + SQR(IMG_DIMENSION))]
+// queue[QUEUE_SLOTS_NR][(1 + sizeof(int) + SQR(IMG_DIMENSION))]
 #define QUEUE_IX(q, first_dim, second_dim) \
-	q[first_dim * (1 + sizeof(int) + SQR(IMG_DIMENSION)) + second_dim]
+	q[first_dim * CELL_SIZE + second_dim]
 
 typedef unsigned char uchar;
 
@@ -259,8 +260,8 @@ __global__ void gpu_tb_server(uchar *rqs, uchar *sqs, bool *terminate) {
 	__shared__ int *output_image_ix;
 
 	// find local queue for thread block
-	rq = rqs + blockIdx.x * (QUEUE_SLOTS_NR * (1 + sizeof(int) + SQR(IMG_DIMENSION)));
-	sq = sqs + blockIdx.x * (QUEUE_SLOTS_NR * (1 + sizeof(int) + SQR(IMG_DIMENSION)));
+	rq = rqs + blockIdx.x * (QUEUE_SLOTS_NR * CELL_SIZE);
+	sq = sqs + blockIdx.x * (QUEUE_SLOTS_NR * CELL_SIZE);
 
 	int tid = threadIdx.x;
 
@@ -387,15 +388,15 @@ void initialize_terminate_variable(bool **cpu_terminate, bool **gpu_terminate)
 	CUDA_CHECK(cudaHostGetDevicePointer(gpu_terminate, *cpu_terminate, 0 ));
 }
 
-void initialize_gpu_tb_server_queues(uchar **cpu_rq, uchar **gpu_rq,
-                                     uchar **cpu_sq, uchar **gpu_sq,
+void initialize_gpu_tb_server_queues(uchar **cpu_rqs, uchar **cpu_sqs,
+                                     uchar **gpu_rqs, uchar **gpu_sqs,
                                      int tb_nr)
 {
-    CUDA_CHECK( cudaHostAlloc(cpu_rq, tb_nr * (QUEUE_SLOTS_NR * (1 + SQR(IMG_DIMENSION))), 0) );
-    CUDA_CHECK( cudaHostAlloc(cpu_sq, tb_nr * (QUEUE_SLOTS_NR * (1 + SQR(IMG_DIMENSION))), 0) );
+    CUDA_CHECK( cudaHostAlloc(cpu_rqs, tb_nr * (QUEUE_SLOTS_NR * CELL_SIZE), 0) );
+    CUDA_CHECK( cudaHostAlloc(cpu_sqs, tb_nr * (QUEUE_SLOTS_NR * CELL_SIZE), 0) );
 
-	CUDA_CHECK(cudaHostGetDevicePointer(gpu_rq, *cpu_rq, 0 ));
-	CUDA_CHECK(cudaHostGetDevicePointer(gpu_sq, *cpu_sq, 0 ));
+	CUDA_CHECK(cudaHostGetDevicePointer(gpu_rqs, *cpu_rqs, 0 ));
+	CUDA_CHECK(cudaHostGetDevicePointer(gpu_sqs, *cpu_sqs, 0 ));
 }
 
 enum {PROGRAM_MODE_STREAMS = 0, PROGRAM_MODE_QUEUE};
@@ -590,7 +591,7 @@ int main(int argc, char *argv[]) {
              * update req_t_end of completed requests
              */
             for (int tb_ix = 0; tb_ix < tb_nr; tb_ix++) {
-            	uchar *cpu_sq = cpu_sqs + tb_ix * (QUEUE_SLOTS_NR * (1 + sizeof(int) + SQR(IMG_DIMENSION)));
+            	uchar *cpu_sq = cpu_sqs + tb_ix * (QUEUE_SLOTS_NR * CELL_SIZE);
 
             	for (int sq_ix = 0; sq_ix < QUEUE_SLOTS_NR; sq_ix ++)
 					// found a processed image
@@ -616,12 +617,18 @@ int main(int argc, char *argv[]) {
 			// we start looking for a free spot in the the queue next
 			// to the one we filled in the previous iteration
             for (int i = 0, tb_ix = next_rq; i < tb_nr ; i++, tb_ix = (tb_ix +1) % tb_nr) {
-				uchar *cpu_rq = cpu_rqs + tb_ix * (QUEUE_SLOTS_NR * (1 + sizeof(int) + SQR(IMG_DIMENSION)));
+				uchar *cpu_rq = cpu_rqs + tb_ix * (QUEUE_SLOTS_NR * CELL_SIZE);
 
             	for (int rq_ix = 0; rq_ix < QUEUE_SLOTS_NR; rq_ix++)
 					if (QUEUE_IX(cpu_rq, rq_ix, VALID_BIT_IX) == 0) {
 					
-						CUDA_CHECK(cudaMemcpy(&QUEUE_IX(cpu_rq, rq_ix, DATA_IX), &gpu_image_in[img_idx * SQR(IMG_DIMENSION)], SQR(IMG_DIMENSION), cudaMemcpyHostToHost));
+						printf("tb_ix: %d, rq_ix is: %d, img_ix: %d\n", tb_ix, rq_ix, img_idx);
+						printf("Accecing DATA_IX\n");
+						/*cpu_rq[DATA_IX] = 2;*/
+
+						/*CUDA_CHECK(cudaMemcpy(&QUEUE_IX(cpu_rq, rq_ix, DATA_IX), &images_in[img_idx * SQR(IMG_DIMENSION)], SQR(IMG_DIMENSION), cudaMemcpyHostToHost));*/
+						CUDA_CHECK( cudaMemcpy(&images_out_from_gpu[0], &images_in[0], SQR(IMG_DIMENSION), cudaMemcpyHostToHost));
+						return 0;
 						CUDA_CHECK(cudaMemcpy(&QUEUE_IX(cpu_rq, rq_ix, IMGIX_BIT_IX), &img_idx, sizeof(int), cudaMemcpyHostToHost));
 						QUEUE_IX(cpu_rq, rq_ix, VALID_BIT_IX) = 1;
 						__sync_synchronize();

@@ -19,12 +19,13 @@
 #define KERNEL_MAX_REGISTERS 32
 
 #define VALID_BIT_IX 0
-#define DATA_IX 1
+#define IMGIX_BIT_IX 1
+#define DATA_IX 1 + sizeof(int)
 
 // Treat a one-dimensional array as a two dimensional array of type
 // queue[QUEUE_SLOTS_NR][(1 + SQR(IMG_DIMENSION))]
 #define QUEUE_IX(q, first_dim, second_dim) \
-	q[first_dim * (1 + SQR(IMG_DIMENSION)) + second_dim]
+	q[first_dim * (1 + sizeof(int) + SQR(IMG_DIMENSION)) + second_dim]
 
 typedef unsigned char uchar;
 
@@ -255,10 +256,11 @@ __global__ void gpu_tb_server(uchar *rqs, uchar *sqs, bool *terminate) {
 	__shared__ int out_ix;
 	__shared__ uchar *rq;
 	__shared__ uchar *sq;
+	__shared__ int *output_image_ix;
 
 	// find local queue for thread block
-	rq = rqs + blockIdx.x * (QUEUE_SLOTS_NR * (1 + SQR(IMG_DIMENSION)));
-	sq = sqs + blockIdx.x * (QUEUE_SLOTS_NR * (1 + SQR(IMG_DIMENSION)));
+	rq = rqs + blockIdx.x * (QUEUE_SLOTS_NR * (1 + sizeof(int) + SQR(IMG_DIMENSION)));
+	sq = sqs + blockIdx.x * (QUEUE_SLOTS_NR * (1 + sizeof(int) + SQR(IMG_DIMENSION)));
 
 	int tid = threadIdx.x;
 
@@ -284,10 +286,18 @@ __global__ void gpu_tb_server(uchar *rqs, uchar *sqs, bool *terminate) {
 		if (tid == 0) {
 
 			__threadfence_system();
+			// we move the img ix number from RQ to SQ
+			output_image_ix = (int *)&QUEUE_IX(sq,out_ix, IMGIX_BIT_IX);
+			*output_image_ix = (int) QUEUE_IX(rq,in_ix,IMGIX_BIT_IX);
+
+			// validate entry
 			QUEUE_IX(sq,out_ix,VALID_BIT_IX) = 1;
+
+			// invalidate rq cell
 			QUEUE_IX(rq,in_ix,VALID_BIT_IX) = 0;
 			__threadfence_system();
 
+			// choose new out_ix
 			for (int i = 0; !(*terminate); (i++) % QUEUE_SLOTS_NR) {
 				if (QUEUE_IX(sq,i,0) == 0) {
 					out_ix = i;
@@ -295,14 +305,12 @@ __global__ void gpu_tb_server(uchar *rqs, uchar *sqs, bool *terminate) {
 					
 				}
 			}
-			// choose new out_ix
 		}
 
 		__threadfence_system();
 		__syncthreads();
 	
 	}
-
 }
 
 void print_usage_and_die(char *progname) {
@@ -326,6 +334,10 @@ int get_threadblock_number_device(int threads_per_block__nr, int device_number) 
 	max_shared_mem_tb_nr = prop.sharedMemPerMultiprocessor / SHARED_MEMORY_SZ_PER_TB;
 	max_regs_tb_nr = prop.regsPerMultiprocessor / (KERNEL_MAX_REGISTERS * threads_per_block__nr);
 
+	printf("threads_tb: %d\nshared_mem_tb: %d\nregs_tb: %d\n",
+			max_threads_tb_nr,  max_shared_mem_tb_nr, max_regs_tb_nr);
+	printf("Num SMs: %d\n", prop.multiProcessorCount);
+
 	tb_nr = (max_threads_tb_nr > max_shared_mem_tb_nr) ? max_shared_mem_tb_nr : max_threads_tb_nr;
 	tb_nr = (tb_nr > max_regs_tb_nr) ? max_regs_tb_nr : tb_nr;
 
@@ -333,10 +345,15 @@ int get_threadblock_number_device(int threads_per_block__nr, int device_number) 
 }
 
 int get_threadblock_number(int threads_nr) {
-	int min = 0, devices_nr;
+	int min, devices_nr;
 
 	CUDA_CHECK(cudaGetDeviceCount(&devices_nr));
-	for (int i = 0; i < devices_nr; i++) {
+
+	if (devices_nr <= 0)
+		return 0;
+
+	min = get_threadblock_number_device(threads_nr, 0);
+	for (int i = 1; i < devices_nr; i++) {
 		int cur = get_threadblock_number_device(threads_nr, i);
 		min = (cur < min) ? cur : min;
 	}
@@ -547,36 +564,103 @@ int main(int argc, char *argv[]) {
     } else if (mode == PROGRAM_MODE_QUEUE) {
         // TODO launch GPU consumer-producer kernel
 		int tb_nr = get_threadblock_number(threads_queue_mode);
-		uchar *cpu_rq, *gpu_rq;
-		uchar *cpu_sq, *gpu_sq;
+		uchar *cpu_rqs, *gpu_rqs;
+		uchar *cpu_sqs, *gpu_sqs;
 		bool *cpu_terminate, *gpu_terminate;
+		int next_rq = 0;
+		int equalized_img_ix;
+		int in_process_imgs = 0;
 
-		initialize_gpu_tb_server_queues(&cpu_rq, &cpu_sq, &gpu_rq, &gpu_sq, tb_nr);
+		printf("Will run with %d thread-blocks\n", tb_nr);
+
+		initialize_gpu_tb_server_queues(&cpu_rqs, &cpu_sqs, &gpu_rqs, &gpu_sqs, tb_nr);
 		initialize_terminate_variable(&cpu_terminate,&gpu_terminate);
 
-		// set programming running
+		// set program running
 		*cpu_terminate = false;
 		__sync_synchronize();
 
 		// launch  servers
-		gpu_tb_server <<< tb_nr, threads_queue_mode >>> (gpu_rq, gpu_sq, gpu_terminate);
+		gpu_tb_server <<< tb_nr, threads_queue_mode >>> (gpu_rqs, gpu_sqs, gpu_terminate);
+		printf("Launched %d servers\n", tb_nr);
 
-        for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
+        for (int img_idx = 0; img_idx < NREQUESTS;) {
             /* TODO check producer consumer queue for any responses.
              * don't block. if no responses are there we'll check again in the next iteration
              * update req_t_end of completed requests
              */
+            for (int tb_ix = 0; tb_ix < tb_nr; tb_ix++) {
+            	uchar *cpu_sq = cpu_sqs + tb_ix * (QUEUE_SLOTS_NR * (1 + sizeof(int) + SQR(IMG_DIMENSION)));
+
+            	for (int sq_ix = 0; sq_ix < QUEUE_SLOTS_NR; sq_ix ++)
+					// found a processed image
+					if (QUEUE_IX(cpu_sq, sq_ix, VALID_BIT_IX) == 1) {
+						equalized_img_ix = (int)QUEUE_IX(cpu_sq, sq_ix, IMGIX_BIT_IX);
+						CUDA_CHECK(cudaMemcpy(&images_out_from_gpu[equalized_img_ix * SQR(IMG_DIMENSION)], &QUEUE_IX(cpu_sq, sq_ix, DATA_IX), SQR(IMG_DIMENSION), cudaMemcpyHostToHost));
+						// invalidate cell
+						QUEUE_IX(cpu_sq, sq_ix, VALID_BIT_IX) = 0;
+
+						printf ("Processed image %d\n", equalized_img_ix);
+						in_process_imgs--;
+					}
+			}
+			__sync_synchronize();
 
             /*rate_limit_wait(&rate_limit);*/
-			if (!rate_limit_can_send(&rate_limit)) {
-                  --img_idx;
+			if (!rate_limit_can_send(&rate_limit))
                   continue;
-            }
 
             req_t_start[img_idx] = get_time_msec();
 
             /* TODO push task to queue */
+			// we start looking for a free spot in the the queue next
+			// to the one we filled in the previous iteration
+            for (int i = 0, tb_ix = next_rq; i < tb_nr ; i++, tb_ix = (tb_ix +1) % tb_nr) {
+				uchar *cpu_rq = cpu_rqs + tb_ix * (QUEUE_SLOTS_NR * (1 + sizeof(int) + SQR(IMG_DIMENSION)));
+
+            	for (int rq_ix = 0; rq_ix < QUEUE_SLOTS_NR; rq_ix++)
+					if (QUEUE_IX(cpu_rq, rq_ix, VALID_BIT_IX) == 0) {
+					
+						CUDA_CHECK(cudaMemcpy(&QUEUE_IX(cpu_rq, rq_ix, DATA_IX), &gpu_image_in[img_idx * SQR(IMG_DIMENSION)], SQR(IMG_DIMENSION), cudaMemcpyHostToHost));
+						CUDA_CHECK(cudaMemcpy(&QUEUE_IX(cpu_rq, rq_ix, IMGIX_BIT_IX), &img_idx, sizeof(int), cudaMemcpyHostToHost));
+						QUEUE_IX(cpu_rq, rq_ix, VALID_BIT_IX) = 1;
+						__sync_synchronize();
+
+						printf ("Sent image %d to process in tb %d, queue %d\n", img_idx,
+																				 tb_ix,
+																				 rq_ix);
+
+						tb_ix = (tb_ix +1) % tb_nr;
+						in_process_imgs++;
+						img_idx++;
+						break;
+					}
+            }
+
         }
+
+		// we wait for all images to process
+
+		while (in_process_imgs > 0) {
+            for (int tb_ix = 0; tb_ix < tb_nr; tb_ix++) {
+            	uchar *cpu_sq = cpu_sqs + tb_ix * (QUEUE_SLOTS_NR * (1 + sizeof(int) + SQR(IMG_DIMENSION)));
+
+            	for (int sq_ix = 0; sq_ix < QUEUE_SLOTS_NR; sq_ix ++)
+					// found a processed image
+					if (QUEUE_IX(cpu_sq, sq_ix, VALID_BIT_IX) == 1) {
+						equalized_img_ix = (int)QUEUE_IX(cpu_sq, sq_ix, IMGIX_BIT_IX);
+						CUDA_CHECK(cudaMemcpy(&images_out_from_gpu[equalized_img_ix * SQR(IMG_DIMENSION)], &QUEUE_IX(cpu_sq, sq_ix, DATA_IX), SQR(IMG_DIMENSION), cudaMemcpyHostToHost));
+						// invalidate cell
+						QUEUE_IX(cpu_sq, sq_ix, VALID_BIT_IX) = 0;
+
+						printf ("Processed image %d\n", equalized_img_ix);
+						in_process_imgs--;
+					}
+			}
+			__sync_synchronize();
+		}
+
+
 
 		// close open threads
 		*cpu_terminate = true;

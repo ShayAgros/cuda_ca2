@@ -10,7 +10,7 @@
 
 ///////////////////////////////////////////////// DO NOT CHANGE ///////////////////////////////////////
 #define IMG_DIMENSION 32
-#define NREQUESTS 15
+#define NREQUESTS 500
 #define THREADS_NR SQR(IMG_DIMENSION)
 
 #define SHARED_MEMORY_SZ_PER_TB (256*2)
@@ -257,33 +257,21 @@ __global__ void gpu_tb_server(uchar *rqs, uchar *sqs, volatile bool *terminate) 
 	__shared__ int out_ix;
 	__shared__ uchar *rq;
 	__shared__ uchar *sq;
-	__shared__ int output_image_ix;
+	int tid = threadIdx.x;
 
 	// find local queue for thread block
 	rq = rqs + blockIdx.x * (QUEUE_SLOTS_NR * CELL_SIZE);
 	sq = sqs + blockIdx.x * (QUEUE_SLOTS_NR * CELL_SIZE);
 
-	int tid = threadIdx.x;
-
-
-	if (tid == 0)
-		printf("GPU: Server %d is up and running\n", blockIdx.x);
-	__syncthreads();
-
-	out_ix = 0;
-
 	while (true) {
 
 		if (tid == 0) {
-
 			for (int i = (rq_ix +1) % QUEUE_SLOTS_NR; ; i = (i+1) % QUEUE_SLOTS_NR) {
 				if (QUEUE_IX(rq,i, VALID_BIT_IX) == 1) {
 					rq_ix = i;
-					printf("GPU: %d: received process request in queue element %d\n",blockIdx.x, rq_ix);
 					break;
 				}
 				if (*terminate) {
-					printf("GPU: %d: received terminate signal \n",blockIdx.x);
 					rq_ix = -1;
 					break;
 				}
@@ -302,9 +290,6 @@ __global__ void gpu_tb_server(uchar *rqs, uchar *sqs, volatile bool *terminate) 
 		if (tid == 0) {
 			// we move the img ix number from RQ to SQ
 			memcpy(&QUEUE_IX(sq,out_ix, IMGIX_BIT_IX), &QUEUE_IX(rq,rq_ix,IMGIX_BIT_IX), sizeof(int));
-			memcpy(&output_image_ix, &QUEUE_IX(sq,out_ix, IMGIX_BIT_IX), sizeof(int));
-
-			printf("GPU: %d: processed image %d\n",blockIdx.x, output_image_ix);
 
 			__threadfence_system();
 			// validate entry
@@ -313,8 +298,6 @@ __global__ void gpu_tb_server(uchar *rqs, uchar *sqs, volatile bool *terminate) 
 			// invalidate rq cell
 			QUEUE_IX(rq,rq_ix,VALID_BIT_IX) = 0;
 			__threadfence_system();
-
-			printf("GPU: %d: sq entry validated\n",blockIdx.x);
 
 			// choose new out_ix
 			for (int i = (out_ix +1) % QUEUE_SLOTS_NR; !(*terminate); i = (i+1) % QUEUE_SLOTS_NR) {
@@ -353,10 +336,6 @@ int get_threadblock_number_device(int threads_per_block__nr, int device_number) 
 	max_shared_mem_tb_nr = prop.sharedMemPerMultiprocessor / SHARED_MEMORY_SZ_PER_TB;
 	max_regs_tb_nr = prop.regsPerMultiprocessor / (KERNEL_MAX_REGISTERS * threads_per_block__nr);
 
-	printf("threads_tb: %d\nshared_mem_tb: %d\nregs_tb: %d\n",
-			max_threads_tb_nr,  max_shared_mem_tb_nr, max_regs_tb_nr);
-	printf("Num SMs: %d\n", prop.multiProcessorCount);
-
 	tb_nr = (max_threads_tb_nr > max_shared_mem_tb_nr) ? max_shared_mem_tb_nr : max_threads_tb_nr;
 	tb_nr = (tb_nr > max_regs_tb_nr) ? max_regs_tb_nr : tb_nr;
 
@@ -384,16 +363,12 @@ void checkCompletedRequests(cudaStream_t streams[64], double *req_t_end,
 							int *free_stream, int stream2img[64])
 {
 	for (int i = 0; i < 64; i++)
-		/*printf("Value of stream2img[%d] is %d\n",i, stream2img[i]);*/
 		if ( cudaStreamQuery(streams[i]) == cudaSuccess) {
-			/*printf("entered condition\n");*/
 			if (*free_stream < 0)
 				*free_stream = i;
 
 			if (stream2img[i] >= 0) {
 				req_t_end[stream2img[i]] = get_time_msec();
-				printf("Stream %d for image %d finished, time %lf\n",
-						i, stream2img[i], req_t_end[stream2img[i]]);
 				stream2img[i] = -1;
 			}
 		}
@@ -570,7 +545,6 @@ int main(int argc, char *argv[]) {
 		for (int j = 0; j < 64; j++) {
 			done += stream2img[j] >= 0;
 		}
-		printf("%d jobs still waiting to finish\n", done);
 
         // busy-wait on jobs till everyone finishes
         while (done > 0) {
@@ -578,8 +552,6 @@ int main(int argc, char *argv[]) {
         	if (stream2img[ix] >= 0 && cudaStreamQuery(streams[ix]) == cudaSuccess) {
 				req_t_end[stream2img[ix]] = get_time_msec();
 				done--;
-				printf("Stream %d for image %d finished, time %f\n",
-						ix, stream2img[ix], req_t_end[stream2img[ix]]);
 				stream2img[ix] = -1;
         	}
         	ix = (ix + 1) % 64;
@@ -596,9 +568,6 @@ int main(int argc, char *argv[]) {
 		int in_process_imgs = 0;
 		bool img_sent = false;
 
-		// TODO: debug, remove later
-		tb_nr = 2;
-
 		initialize_gpu_tb_server_queues(&cpu_rqs, &cpu_sqs, &gpu_rqs, &gpu_sqs, tb_nr);
 		initialize_terminate_variable(&cpu_terminate,&gpu_terminate);
 
@@ -608,7 +577,6 @@ int main(int argc, char *argv[]) {
 
 		// launch  servers
 		gpu_tb_server <<< tb_nr, threads_queue_mode >>> (gpu_rqs, gpu_sqs, gpu_terminate);
-		printf("CPU: Launched %d servers\n", tb_nr);
 
         for (int img_idx = 0; img_idx < NREQUESTS;) {
             /* TODO check producer consumer queue for any responses.
@@ -629,7 +597,6 @@ int main(int argc, char *argv[]) {
 						QUEUE_IX(cpu_sq, sq_ix, VALID_BIT_IX) = 0;
 
 						req_t_end[equalized_img_ix] = get_time_msec();
-						printf ("CPU: received processed image %d from %d\n", equalized_img_ix, tb_ix);
 						in_process_imgs--;
 					}
 			}
@@ -659,9 +626,6 @@ int main(int argc, char *argv[]) {
 						QUEUE_IX(cpu_rq, rq_ix, VALID_BIT_IX) = 1;
 						__sync_synchronize();
 
-						printf ("CPU: Sent image %d to process in tb %d, queue %d\n", img_idx,
-																				 tb_ix,
-																				 rq_ix);
 						// try a different rq next time
 						next_rq = (next_rq + 1) % tb_nr;
 						// increase "in-flight" images
@@ -675,8 +639,6 @@ int main(int argc, char *argv[]) {
         }
 
 		// we wait for all images to process
-		printf("CPU: waiting for %d images to complete\n", in_process_imgs);
-
 		while (in_process_imgs > 0) {
             for (int tb_ix = 0; tb_ix < tb_nr; tb_ix++) {
             	uchar *cpu_sq = cpu_sqs + tb_ix * (QUEUE_SLOTS_NR * CELL_SIZE);
@@ -694,7 +656,6 @@ int main(int argc, char *argv[]) {
 						QUEUE_IX(cpu_sq, sq_ix, VALID_BIT_IX) = 0;
 
 						req_t_end[equalized_img_ix] = get_time_msec();
-						printf ("CPU: received processed image %d from %d\n", equalized_img_ix, tb_ix);
 						in_process_imgs--;
 					}
 			}

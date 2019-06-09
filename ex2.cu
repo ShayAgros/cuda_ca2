@@ -10,7 +10,7 @@
 
 ///////////////////////////////////////////////// DO NOT CHANGE ///////////////////////////////////////
 #define IMG_DIMENSION 32
-#define NREQUESTS 500
+#define NREQUESTS 30000
 #define THREADS_NR SQR(IMG_DIMENSION)
 
 #define SHARED_MEMORY_SZ_PER_TB (256*2)
@@ -667,6 +667,10 @@ int main(int argc, char *argv[]) {
 		__sync_synchronize();
         CUDA_CHECK(cudaDeviceSynchronize());
 
+
+        CUDA_CHECK(cudaFreeHost(cpu_rqs));
+        CUDA_CHECK(cudaFreeHost(cpu_sqs));
+        CUDA_CHECK(cudaFreeHost(cpu_terminate));
         /* TODO wait until you have responses for all requests */
 
     } else {
@@ -688,5 +692,7 @@ int main(int argc, char *argv[]) {
     printf("throughput = %lf (req/sec)\n", NREQUESTS / (tf - ti) * 1e+3);
     printf("average latency = %lf (msec)\n", avg_latency);
 
+	CUDA_CHECK(cudaFreeHost(images_in));
+	CUDA_CHECK(cudaFreeHost(images_out));
     return 0;
 }
